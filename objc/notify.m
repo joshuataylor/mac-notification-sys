@@ -213,7 +213,9 @@ void sendNotification(NSString* title, NSString* subtitle, NSString* message, NS
         if (options[@"actions"] && ![options[@"actions"] isEqualToString:@""]) {
             [userNotification setValue:@YES forKey:@"_showsButtons"];
             NSArray* myActions = [options[@"actions"] componentsSeparatedByString:@","];
-            if (myActions.count > 1) {
+            // One alternate is still a menu (main title + it), so don't
+            // drop it: with `> 1` a two-entry dropdown lost its second entry.
+            if (myActions.count > 0) {
                 [userNotification setValue:@YES forKey:@"_alwaysShowAlternateActionMenu"];
                 [userNotification setValue:myActions forKey:@"_alternateActionButtonTitles"];
             }
@@ -341,7 +343,9 @@ void sendNotification(NSString* title, NSString* subtitle, NSString* message, NS
         case NSUserNotificationActivationTypeActionButtonClicked:
         case NSUserNotificationActivationTypeAdditionalActionClicked: {
             NSArray* altTitles = [(NSObject*)notification valueForKey:@"_alternateActionButtonTitles"];
-            if ([altTitles count] > 1) {
+            // Must match the `> 0` in sendNotification, or picking the only
+            // alternate reports the main button's title instead.
+            if ([altTitles count] > 0) {
                 NSNumber* altIdx = [(NSObject*)notification valueForKey:@"_alternateActionIndex"];
                 unsigned long long idx = [altIdx unsignedLongLongValue];
                 if (idx == (unsigned long long)LONG_MAX) {
