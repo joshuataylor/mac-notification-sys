@@ -75,6 +75,94 @@ void showWhenFrontmost(BOOL value) {
     presentWhenFrontmost = value;
 }
 
+// Shared auto-dismiss poller for notifications sent from a background thread.
+//
+// Each waiting notification used to get its own repeating timer, and every tick fetched the whole
+// deliveredNotifications list from usernoted. With N notifications open that is N fetches per
+// interval, each returning N notifications, so a long-running process that leaves notifications
+// in Notification Centre burns CPU in itself and in usernoted. Instead, one timer on the main run
+// loop fetches deliveredNotifications once per tick and resolves every pending notification that
+// has disappeared. The timer only exists while something is pending.
+//
+// All state below is touched only on the main thread.
+static const NSTimeInterval kDismissPollSecs = 1.0;
+static NSMutableDictionary* pendingDismissPolls = nil; // identifier -> @[uuid NSData, start NSDate]
+static NSTimer* dismissPollTimer = nil;
+static BOOL dismissPollRunning = NO;
+
+static void stopDismissPollTimerIfIdle(void) {
+    if (dismissPollTimer != nil && [pendingDismissPolls count] == 0) {
+        [dismissPollTimer invalidate];
+        dismissPollTimer = nil;
+    }
+}
+
+static void dismissPollTick(void) {
+    // resolveAutoDismiss drains the run loop, which can fire this timer again. One tick at a time.
+    if (dismissPollRunning)
+        return;
+    dismissPollRunning = YES;
+    @autoreleasepool {
+        NSMutableSet* delivered = [NSMutableSet set];
+        for (NSUserNotification* n in [NSUserNotificationCenter defaultUserNotificationCenter].deliveredNotifications) {
+            if (n.identifier)
+                [delivered addObject:n.identifier];
+        }
+
+        NSMutableArray* dismissed = [NSMutableArray array];
+        for (NSString* identifier in [pendingDismissPolls allKeys]) {
+            NSArray* entry = pendingDismissPolls[identifier];
+            NSData* uuid = entry[0];
+            NSDate* started = entry[1];
+            if (rust_notification_is_done(uuid.bytes)) {
+                // a delegate callback already resolved it, and the waiter unregisters it too
+                [pendingDismissPolls removeObjectForKey:identifier];
+            } else if (!rust_notification_is_delivered(uuid.bytes)) {
+                // still waiting for didDeliverNotification:, which would otherwise look like an
+                // immediate dismiss. Give up after the delivery timeout, as the main-thread path does.
+                if (-[started timeIntervalSinceNow] > kDeliveryTimeoutSecs) {
+                    [dismissed addObject:uuid];
+                    [pendingDismissPolls removeObjectForKey:identifier];
+                }
+            } else if (![delivered containsObject:identifier]) {
+                [dismissed addObject:uuid];
+                [pendingDismissPolls removeObjectForKey:identifier];
+            }
+        }
+        for (NSData* uuid in dismissed) {
+            resolveAutoDismiss(uuid.bytes);
+        }
+    }
+    stopDismissPollTimerIfIdle();
+    dismissPollRunning = NO;
+}
+
+// Called on any thread. Adds the notification to the shared poller.
+static void registerDismissPoll(NSString* identifier, NSData* uuid) {
+    NSDate* started = [NSDate date];
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (pendingDismissPolls == nil)
+          pendingDismissPolls = [[NSMutableDictionary alloc] init];
+      pendingDismissPolls[identifier] = @[ uuid, started ];
+      if (dismissPollTimer == nil) {
+          dismissPollTimer = [NSTimer timerWithTimeInterval:kDismissPollSecs
+                                                    repeats:YES
+                                                      block:^(__unused NSTimer* t) {
+                                                        dismissPollTick();
+                                                      }];
+          [[NSRunLoop mainRunLoop] addTimer:dismissPollTimer forMode:NSDefaultRunLoopMode];
+      }
+    });
+}
+
+// Called on any thread once the waiter has its result.
+static void unregisterDismissPoll(NSString* identifier) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [pendingDismissPolls removeObjectForKey:identifier];
+      stopDismissPollTimerIfIdle();
+    });
+}
+
 // shouldWait: NO = fire-and-forget, return immediately after delivery
 // if YES, blocks until the user interacts or the notification is auto-dismissed.
 // Result is communicated back to Rust via rust_notification_activated / rust_notification_dismissed /
@@ -212,33 +300,15 @@ void sendNotification(NSString* title, NSString* subtitle, NSString* message, NS
                     resolveAutoDismiss(notificationId);
             }
         } else {
-            // callbacks come in on main thread, start poll timer there (#86)
-            // copy UUID to NSData so the block owns the lifetime, not the Rust stack
+            // callbacks come in on the main thread, so the auto-dismiss poll runs there (#86),
+            // shared with every other waiting notification.
+            // copy UUID to NSData so the poller owns the lifetime, not the Rust stack
             NSData* notificationIdData = [NSData dataWithBytes:notificationId length:16];
-            NSDate* pollStarted = [NSDate date];
-            NSTimer* dismissPoll = [NSTimer timerWithTimeInterval:0.5
-                                                          repeats:YES
-                                                            block:^(NSTimer* t) {
-                                                              // wait for delivery before checking dismiss, same logic as main thread
-                                                              if (!rust_notification_is_delivered(notificationIdData.bytes)) {
-                                                                  if (!rust_notification_is_done(notificationIdData.bytes) && -[pollStarted timeIntervalSinceNow] > kDeliveryTimeoutSecs) {
-                                                                      [t invalidate];
-                                                                      resolveAutoDismiss(notificationIdData.bytes);
-                                                                  }
-                                                                  return;
-                                                              }
-                                                              if (wasAutoDismissed()) {
-                                                                  [t invalidate];
-                                                                  resolveAutoDismiss(notificationIdData.bytes);
-                                                              }
-                                                            }];
-            [[NSRunLoop mainRunLoop] addTimer:dismissPoll forMode:NSDefaultRunLoopMode];
+            registerDismissPoll(identifierString, notificationIdData);
             // Blocks until rust_notification_auto_dismissed / rust_notification_activated /
             // rust_notification_dismissed signals the Condvar.
             rust_wait_for_notification(notificationId);
-            dispatch_async(dispatch_get_main_queue(), ^{
-              [dismissPoll invalidate];
-            });
+            unregisterDismissPoll(identifierString);
         }
     }
 }
